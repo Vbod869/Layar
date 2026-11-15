@@ -1,7 +1,11 @@
 const ARCHIVE = 'https://archive.org'
 const CC0 = 'http://creativecommons.org/publicdomain/zero/1.0/'
 const BASE_QUERY = `mediatype:movies AND collection:feature_films AND licenseurl:"${CC0}"`
-const state = { search: '', genre: '', sort: 'downloads desc', page: 1, loading: false, movies: [] }
+const state = { search: '', genre: '', sort: 'downloads desc', page: 1, loading: false, movies: [], source: 'archive', youtubeNextPage: null }
+const YOUTUBE_API = 'https://www.googleapis.com/youtube/v3'
+const YOUTUBE_KEY_STORAGE = 'layar_youtube_api_key'
+let youtubeApiKey = ''
+
 let activeRequest
 
 const grid = document.querySelector('#movie-grid')
@@ -22,6 +26,15 @@ const archiveViews = document.querySelector('#archive-views')
 const archiveRating = document.querySelector('#archive-rating')
 const archiveReviewsCount = document.querySelector('#archive-reviews-count')
 const archiveReviewsList = document.querySelector('#archive-reviews-list')
+const youtubePlayer = document.querySelector('#youtube-player')
+const archiveCommunity = document.querySelector('#archive-community')
+const playerKicker = document.querySelector('#player-kicker')
+const playerFooterNote = document.querySelector('#player-footer-note')
+const catalogSourceLink = document.querySelector('#catalog-source-link')
+const youtubeKeyPanel = document.querySelector('#youtube-key-panel')
+const youtubeKeyForm = document.querySelector('#youtube-key-form')
+const youtubeKeyInput = document.querySelector('#youtube-api-key')
+
 
 function formatCount(value) {
   const number = Number(value)
@@ -86,6 +99,151 @@ function renderArchiveReviews(reviews) {
     item.append(top, title, body, date)
     archiveReviewsList.append(item)
   })
+}
+
+
+function youtubeKey() {
+  return youtubeApiKey || localStorage.getItem(YOUTUBE_KEY_STORAGE) || ''
+}
+function setSource(source) {
+  state.source = source
+  document.querySelectorAll('.source-switch-button').forEach((button) => {
+    const active = button.dataset.source === source
+    button.classList.toggle('is-active', active)
+    button.setAttribute('aria-pressed', String(active))
+  })
+  youtubeKeyPanel.hidden = source !== 'youtube'
+  catalogSourceLink.href = source === 'youtube' ? 'https://www.youtube.com/results?search_query=creative+commons+full+movie' : 'https://archive.org/details/feature_films'
+  catalogSourceLink.innerHTML = source === 'youtube' ? 'Sumber: YouTube <span aria-hidden="true">↗</span>' : 'Sumber: Internet Archive <span aria-hidden="true">↗</span>'
+  resultsTitle.textContent = source === 'youtube' ? 'Film panjang berlisensi Creative Commons' : 'Pilihan dari arsip'
+  state.page = 1
+  state.youtubeNextPage = null
+  fetchMovies(false)
+}
+function parseIsoDuration(value) {
+  const match = /^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/.exec(value || '')
+  if (!match) return 0
+  return Number(match[1] || 0) * 3600 + Number(match[2] || 0) * 60 + Number(match[3] || 0)
+}
+function formatDuration(seconds) {
+  const h = Math.floor(seconds / 3600)
+  const m = Math.floor((seconds % 3600) / 60)
+  return h ? `${h}j ${m}m` : `${m} menit`
+}
+function youtubeSearchQuery() {
+  const base = state.search ? `${state.search} full movie` : 'full length movie'
+  return state.genre ? `${base} ${state.genre}` : base
+}
+async function fetchYoutubeMovies(append = false) {
+  const key = youtubeKey()
+  if (!key) {
+    grid.replaceChildren()
+    statusMessage.textContent = 'Masukkan YouTube API Key pada panel di atas untuk mulai mencari film.'
+    resultsCount.textContent = 'API key diperlukan'
+    loadMoreButton.hidden = true
+    return
+  }
+  setLoading(true)
+  statusMessage.textContent = append ? 'Memuat video berikutnya…' : 'Mencari film di YouTube…'
+  if (!append) showSkeletons()
+  try {
+    const params = new URLSearchParams({
+      key, part:'snippet', type:'video', q:youtubeSearchQuery(),
+      maxResults:'18', order:'relevance', videoDuration:'long',
+      videoEmbeddable:'true', videoLicense:'creativeCommon',
+      regionCode:'ID', relevanceLanguage:'id'
+    })
+    if (append && state.youtubeNextPage) params.set('pageToken', state.youtubeNextPage)
+    const response = await fetch(`${YOUTUBE_API}/search?${params}`)
+    const payload = await response.json()
+    if (!response.ok) throw new Error(payload?.error?.message || `YouTube API ${response.status}`)
+    const items = (payload.items || []).filter(item => item.id?.videoId)
+    const ids = items.map(item => item.id.videoId).join(',')
+    let details = {}
+    if (ids) {
+      const detailParams = new URLSearchParams({key, part:'contentDetails,status,statistics', id:ids})
+      const detailResponse = await fetch(`${YOUTUBE_API}/videos?${detailParams}`)
+      const detailPayload = await detailResponse.json()
+      if (!detailResponse.ok) throw new Error(detailPayload?.error?.message || 'Gagal mengambil detail video')
+      details = Object.fromEntries((detailPayload.items || []).map(item => [item.id,item]))
+    }
+    const movies = items.map(item => {
+      const detail = details[item.id.videoId] || {}
+      const seconds = parseIsoDuration(detail.contentDetails?.duration)
+      return {
+        identifier:item.id.videoId, title:item.snippet?.title || 'Video tanpa judul',
+        year:item.snippet?.publishedAt?.slice(0,4) || '',
+        creator:item.snippet?.channelTitle || 'Kanal YouTube',
+        description:item.snippet?.description || '',
+        thumbnail:item.snippet?.thumbnails?.high?.url || item.snippet?.thumbnails?.medium?.url || item.snippet?.thumbnails?.default?.url || '',
+        duration:seconds, views:detail.statistics?.viewCount || '—',
+        avg_rating:null, num_reviews:0, source:'youtube',
+        embeddable:detail.status?.embeddable === true,
+        license:detail.status?.license || 'unknown'
+      }
+    }).filter(movie => movie.duration >= 20*60 && movie.embeddable && movie.license === 'creativeCommon')
+    state.youtubeNextPage = payload.nextPageToken || null
+    renderYoutubeMovies(movies, append)
+    resultsCount.textContent = `${movies.length} video cocok`
+    if (!movies.length) statusMessage.textContent = 'Tidak ada hasil yang memenuhi filter durasi, embedding, dan lisensi Creative Commons. Coba kata kunci lain.'
+  } catch (error) {
+    grid.replaceChildren()
+    const message = document.createElement('p')
+    message.className = 'empty-state'
+    const strong = document.createElement('strong')
+    strong.textContent = 'YouTube API tidak dapat dimuat'
+    const span = document.createElement('span')
+    span.textContent = error.message.includes('quota') ? 'Kuota pencarian YouTube hari ini mungkin habis. Search API menggunakan 100 unit per permintaan.' : error.message
+    message.append(strong,span)
+    grid.append(message)
+    statusMessage.textContent = 'Periksa API key, pembatasan domain, dan status YouTube Data API v3 di Google Cloud.'
+    resultsCount.textContent = 'Gagal memuat'
+    loadMoreButton.hidden = true
+  } finally { setLoading(false) }
+}
+function renderYoutubeMovies(movies, append=false) {
+  if (!append) state.movies = []
+  state.movies.push(...movies)
+  if (!append) grid.replaceChildren()
+  const fragment = document.createDocumentFragment()
+  movies.forEach((movie,index) => {
+    const article = document.createElement('article')
+    article.className = 'movie-card'
+    const button = document.createElement('button')
+    button.type = 'button'; button.className = 'poster-button'
+    button.dataset.identifier = movie.identifier
+    button.dataset.title = movie.title
+    const image = document.createElement('img')
+    image.src = movie.thumbnail; image.alt = `Thumbnail ${movie.title}`; image.loading = 'lazy'
+    const overlay = document.createElement('span'); overlay.className = 'poster-overlay'
+    const play = document.createElement('span'); play.className = 'play-circle'; play.textContent = '▶'
+    const label = document.createElement('span'); label.className = 'quick-watch'; label.textContent = 'TONTON DI YOUTUBE'
+    overlay.append(play,label)
+    const badge = document.createElement('span'); badge.className = 'youtube-card-badge'; badge.textContent = 'CC · YOUTUBE'
+    button.append(image,overlay,badge)
+    const info = document.createElement('div'); info.className='movie-info'
+    const title = document.createElement('h4'); title.textContent=movie.title
+    const meta = document.createElement('p'); meta.textContent=[movie.year,movie.creator,formatDuration(movie.duration)].filter(Boolean).join(' · ')
+    const stats = document.createElement('div'); stats.className='movie-api-stats'
+    const views = document.createElement('span'); views.textContent=`▶ ${Number(movie.views).toLocaleString('id-ID')} views`
+    stats.append(views); info.append(title,meta,stats); article.append(button,info)
+    fragment.append(article)
+  })
+  grid.append(fragment)
+  if (!append && movies[0]) {
+    const first=movies[0]
+    document.querySelector('#feature-image').src=first.thumbnail
+    document.querySelector('#feature-image').alt=`Thumbnail ${first.title}`
+    document.querySelector('#feature-title').textContent=first.title
+    document.querySelector('#feature-meta').textContent=[first.year,first.creator].filter(Boolean).join(' · ')
+    document.querySelector('#feature-index').textContent=`01 / ${String(movies.length).padStart(2,'0')}`
+    const featurePlay=document.querySelector('#feature-play')
+    featurePlay.dataset.identifier=first.identifier; featurePlay.dataset.title=first.title
+  }
+  statusMessage.textContent = movies.length ? '' : 'Tidak ada hasil yang cocok.'
+  loadMoreButton.hidden = !state.youtubeNextPage
+  loadMoreButton.disabled = false
+  loadMoreButton.textContent = 'Muat film lainnya ↓'
 }
 
 function escapeLucene(value) {
@@ -249,6 +407,7 @@ function renderError() {
 }
 
 async function fetchMovies(append = false) {
+  if (state.source === 'youtube') return fetchYoutubeMovies(append)
   activeRequest?.abort()
   activeRequest = new AbortController()
   setLoading(true)
@@ -258,174 +417,4 @@ async function fetchMovies(append = false) {
   try {
     const response = await fetch(buildSearchUrl(), { signal: activeRequest.signal })
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
-    const payload = await response.json()
-    const docs = payload?.response?.docs
-    if (!Array.isArray(docs)) throw new Error('Format data arsip tidak dikenali')
-    window.archiveResultCount = Number(payload.response.numFound || 0)
-    renderMovies(docs, append)
-    if (state.movies.length < window.archiveResultCount) loadMoreButton.hidden = false
-  } catch (error) {
-    if (error.name !== 'AbortError') renderError()
-  } finally {
-    setLoading(false)
-  }
-}
-
-function updateResultsTitle() {
-  if (state.search) resultsTitle.textContent = `Hasil pencarian: “${state.search}”`
-  else if (state.genre) resultsTitle.textContent = `Film ${state.genre}`
-  else resultsTitle.textContent = state.sort === 'publicdate desc' ? 'Baru ditambahkan' : 'Pilihan dari arsip'
-}
-
-function selectGenre(button) {
-  document.querySelectorAll('.genre-chip').forEach((chip) => {
-    const active = chip === button
-    chip.classList.toggle('is-active', active)
-    chip.setAttribute('aria-pressed', String(active))
-  })
-  state.genre = button.dataset.genre || ''
-  state.search = ''
-  searchInput.value = ''
-  state.page = 1
-  updateResultsTitle()
-  fetchMovies(false)
-}
-
-async function playMovie(identifier, title) {
-  if (!identifier) return
-  playerTitle.textContent = title || 'Memuat film…'
-  playerDescription.textContent = ''
-  playerStatus.textContent = 'Menyiapkan video…'
-  playerStatus.hidden = false
-  video.hidden = true
-  video.removeAttribute('src')
-  video.load()
-  sourcePage.href = `${ARCHIVE}/details/${encodeURIComponent(identifier)}`
-  dialog.showModal()
-
-  try {
-    const response = await fetch(`${ARCHIVE}/metadata/${encodeURIComponent(identifier)}`)
-    if (!response.ok) throw new Error(`HTTP ${response.status}`)
-    const item = await response.json()
-    const matchingMovie = state.movies.find((movie) => movie.identifier === identifier) || {}
-    renderArchiveStats(matchingMovie)
-    try {
-      const viewsResponse = await fetch(`https://be-api.us.archive.org/views/v1/short/${encodeURIComponent(identifier)}`)
-      if (viewsResponse.ok) {
-        const viewsPayload = await viewsResponse.json()
-        const count = viewsPayload?.[identifier]?.all_time
-        archiveViews.textContent = count == null ? '—' : formatCount(count)
-      }
-    } catch { archiveViews.textContent = '—' }
-    renderArchiveReviews(item.reviews || {})
-    const itemTitle = Array.isArray(item.metadata?.title) ? item.metadata.title[0] : item.metadata?.title
-    const description = Array.isArray(item.metadata?.description) ? item.metadata.description[0] : item.metadata?.description
-    const files = (item.files || [])
-      .filter((file) => /mpeg4/i.test(file.format || '') && /\.(mp4|m4v)$/i.test(file.name || ''))
-      .sort((first, second) => Number(first.size || Infinity) - Number(second.size || Infinity))
-    playerTitle.textContent = itemTitle || title || 'Film dari arsip'
-    playerDescription.textContent = description || ''
-
-    if (!files.length) {
-      playerStatus.textContent = 'Belum ada file video MPEG-4 yang kompatibel. Gunakan tautan sumber untuk melihat pilihan format.'
-      const sourceLink = document.createElement('a')
-      sourceLink.href = sourcePage.href
-      sourceLink.target = '_blank'
-      sourceLink.rel = 'noreferrer'
-      sourceLink.textContent = 'Buka halaman film di Internet Archive'
-      playerStatus.append(document.createElement('br'), sourceLink)
-      return
-    }
-
-    const file = files[0]
-    video.src = `${ARCHIVE}/download/${encodeURIComponent(identifier)}/${encodeURIComponent(file.name)}`
-    video.hidden = false
-    video.load()
-    playerStatus.hidden = true
-  } catch {
-    playerStatus.textContent = 'Detail film tidak dapat dimuat. Buka halaman sumber untuk mencoba pemutaran di Internet Archive.'
-    const sourceLink = document.createElement('a')
-    sourceLink.href = sourcePage.href
-    sourceLink.target = '_blank'
-    sourceLink.rel = 'noreferrer'
-    sourceLink.textContent = 'Buka halaman sumber'
-    playerStatus.append(document.createElement('br'), sourceLink)
-  }
-}
-
-searchToggle.addEventListener('click', () => {
-  searchInput.focus()
-  searchForm.classList.add('is-focused')
-})
-
-searchForm.addEventListener('submit', (event) => {
-  event.preventDefault()
-  searchForm.classList.remove('is-focused')
-  state.search = searchInput.value.trim()
-  state.genre = ''
-  state.page = 1
-  document.querySelectorAll('.genre-chip').forEach((chip) => {
-    const active = !chip.dataset.genre
-    chip.classList.toggle('is-active', active)
-    chip.setAttribute('aria-pressed', String(active))
-  })
-  updateResultsTitle()
-  fetchMovies(false)
-})
-
-document.querySelectorAll('.tab-button').forEach((button) => {
-  button.addEventListener('click', () => {
-    document.querySelectorAll('.tab-button').forEach((tab) => {
-      const active = tab === button
-      tab.classList.toggle('is-active', active)
-      tab.setAttribute('aria-pressed', String(active))
-    })
-    state.sort = button.dataset.sort
-    state.page = 1
-    updateResultsTitle()
-    fetchMovies(false)
-  })
-})
-
-document.querySelector('#genre-list').addEventListener('click', (event) => {
-  const button = event.target.closest('.genre-chip')
-  if (button) selectGenre(button)
-})
-
-grid.addEventListener('click', (event) => {
-  const button = event.target.closest('[data-identifier]')
-  if (button) playMovie(button.dataset.identifier, button.dataset.title)
-})
-
-document.querySelector('#feature-play').addEventListener('click', (event) => {
-  const button = event.currentTarget
-  playMovie(button.dataset.identifier, button.dataset.title)
-})
-
-loadMoreButton.addEventListener('click', () => {
-  if (state.loading) return
-  state.page += 1
-  fetchMovies(true)
-})
-
-document.querySelector('#player-close').addEventListener('click', () => dialog.close())
-dialog.addEventListener('click', (event) => {
-  if (event.target === dialog) dialog.close()
-})
-dialog.addEventListener('close', () => {
-  video.pause()
-  video.removeAttribute('src')
-  video.load()
-})
-
-fetchMovies(false)
-
-
-// Tutup splash screen setelah 7 detik.
-const splashScreen = document.querySelector('#splash-screen')
-if (splashScreen) {
-  window.setTimeout(() => {
-    splashScreen.classList.add('is-hidden')
-    window.setTimeout(() => splashScreen.remove(), 600)
-  }, 7000)
-}
+    cons
